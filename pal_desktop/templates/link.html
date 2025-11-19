@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>PAL Linking</title>
+  <style>
+    body {font-family:sans-serif;padding:24px;}
+    .card{max-width:420px;padding:20px;border:1px solid #ccc;border-radius:12px;}
+    .ok{color:green;font-weight:600;}
+  </style>
+</head>
+<body>
+  <h2>Link this device</h2>
+  <div class="card">
+    <p>Scan this QR with the PAL mobile app:</p>
+    <img src="{{ qr_src }}" width="300" height="300"/>
+    <p>Session ID: <code id="sid">{{ sid }}</code></p>
+    <div id="s">Waiting for phone advertising via BLE…</div>
+    <div id="l"></div>
+  </div>
+
+  <script>
+    const sid=document.getElementById('sid').textContent;
+    async function poll(){
+      try{
+        const r=await fetch(`/status?sid=${sid}`);
+        if(r.ok){
+          const j=await r.json();
+          document.getElementById('s').textContent =
+            j.bleSeen ? "Phone seen via BLE." : "Waiting for phone advertising via BLE…";
+          if(j.linked){
+            document.getElementById('l').innerHTML =
+              "<span class='ok'>✅ Linked!</span>";
+            return;
+          }
+        }
+      }catch(e){}
+      setTimeout(poll,1200);
+    }
+    poll();
+  </script>
+</body>
+</html>

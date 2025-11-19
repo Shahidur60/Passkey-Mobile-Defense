@@ -1,0 +1,359 @@
+import 'dart:convert';
+import 'dart:math' as math;
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:http/http.dart' as http;
+import 'package:local_auth/local_auth.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:pointycastle/export.dart' as pc;
+import 'package:qr_code_scanner_plus/qr_code_scanner_plus.dart';
+
+void main() => runApp(const MyApp());
+
+const String userId = 'user-123';
+// ⚠️ Replace with your PC’s LAN IP (same as server base URL)
+const String baseUrl = "http://10.246.106.30:8889";
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext c) => const MaterialApp(home: Home());
+}
+
+class Home extends StatefulWidget {
+  const Home({super.key});
+  @override
+  State<Home> createState() => _HomeState();
+}
+
+class _HomeState extends State<Home> {
+  final storage = const FlutterSecureStorage();
+  final auth = LocalAuthentication();
+  static const MethodChannel _bleChannel = MethodChannel('ble_channel');
+
+  String status = "Ready";
+  bool isAdvertising = false;
+
+  // ---------------- Utility helpers ----------------
+  String b64u(List<int> d) => base64Url.encode(d).replaceAll('=', '');
+
+  Uint8List _b64UrlFlexDecode(String s) {
+    final pad = (4 - (s.length % 4)) % 4;
+    return base64Url.decode(s + ('=' * pad));
+  }
+
+  pc.SecureRandom _secureRandom() {
+    final rnd = pc.FortunaRandom();
+    final seed = Uint8List(32);
+    final rs = math.Random.secure();
+    for (int i = 0; i < seed.length; i++) seed[i] = rs.nextInt(256);
+    rnd.seed(pc.KeyParameter(seed));
+    return rnd;
+  }
+
+  Uint8List _sha256(List<int> message) {
+    final d = pc.SHA256Digest();
+    return d.process(Uint8List.fromList(message));
+  }
+
+  BigInt _bigIntFromBytes(Uint8List bytes) {
+    BigInt r = BigInt.zero;
+    for (final b in bytes) {
+      r = (r << 8) | BigInt.from(b);
+    }
+    return r;
+  }
+
+  Uint8List _toUnsignedBytes(BigInt v) {
+    if (v == BigInt.zero) return Uint8List.fromList([0]);
+    var hex = v.toRadixString(16);
+    if (hex.length % 2 != 0) hex = '0$hex';
+    final len = hex.length ~/ 2;
+    final out = Uint8List(len);
+    for (int i = 0; i < len; i++) {
+      out[i] = int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16);
+    }
+    int i = 0;
+    while (i < out.length - 1 && out[i] == 0) i++;
+    return Uint8List.fromList(out.sublist(i));
+  }
+
+  Uint8List _encodeDerLen(int len) {
+    if (len < 0x80) return Uint8List.fromList([len]);
+    final bytes = <int>[];
+    var n = len;
+    while (n > 0) {
+      bytes.insert(0, n & 0xff);
+      n >>= 8;
+    }
+    return Uint8List.fromList([0x80 | bytes.length, ...bytes]);
+  }
+
+  Uint8List _encodeDerRStoBytes(BigInt r, BigInt s) {
+    Uint8List encodeInt(BigInt v) {
+      var b = _toUnsignedBytes(v);
+      if (b.isNotEmpty && (b[0] & 0x80) != 0) {
+        b = Uint8List.fromList([0x00, ...b]);
+      }
+      return b;
+    }
+
+    final rBytes = encodeInt(r);
+    final sBytes = encodeInt(s);
+    final totalLen = 2 + rBytes.length + 2 + sBytes.length;
+    final out = BytesBuilder();
+    out.addByte(0x30);
+    out.add(_encodeDerLen(totalLen));
+    out.addByte(0x02);
+    out.add(_encodeDerLen(rBytes.length));
+    out.add(rBytes);
+    out.addByte(0x02);
+    out.add(_encodeDerLen(sBytes.length));
+    out.add(sBytes);
+    return out.toBytes();
+  }
+
+  Uint8List _ecdsaSignDerSha256P256(Uint8List message, Uint8List dBytes) {
+    final params = pc.ECDomainParameters('prime256v1');
+    final dBI = _bigIntFromBytes(dBytes);
+    final priv = pc.ECPrivateKey(dBI, params);
+    final signer = pc.Signer('SHA-256/ECDSA');
+    signer.init(
+      true,
+      pc.ParametersWithRandom(pc.PrivateKeyParameter(priv), _secureRandom()),
+    );
+    final sig = signer.generateSignature(message) as pc.ECSignature;
+    final nHalf = params.n >> 1;
+    var r = sig.r, s = sig.s;
+    if (s.compareTo(nHalf) > 0) s = params.n - s;
+    return _encodeDerRStoBytes(r, s);
+  }
+
+  // ---------------- Permissions ----------------
+  Future<void> _ensureBlePermissions() async {
+    final statuses = await [
+      Permission.bluetoothAdvertise,
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.locationWhenInUse,
+    ].request();
+
+    if (statuses.values.any((s) => s.isDenied)) {
+      throw Exception("❌ BLE permissions not granted");
+    }
+  }
+
+  // ---------------- Key generation ----------------
+  Future<void> registerKey() async {
+    setState(() => status = "Generating key...");
+    final rnd = math.Random.secure();
+    final d = List<int>.generate(32, (_) => rnd.nextInt(256));
+    await storage.write(key: 'passkey_priv_$userId', value: base64Url.encode(d));
+    setState(() => status = "✅ Local key created. Ready to link.");
+  }
+
+  // ---------------- Main linking flow ----------------
+  Future<void> scanAndLink() async {
+    final qrData = await Navigator.push<String?>(
+      context,
+      MaterialPageRoute(builder: (_) => const ScanPage()),
+    );
+    if (qrData == null) return;
+
+    try {
+      // ✅ decode URL-encoded JSON from QR
+      final decoded = Uri.decodeFull(qrData.trim());
+      final payload = jsonDecode(decoded);
+
+      final sid = payload['sid'];
+      final rpId = payload['rpId'];
+      final urlFromQr = payload['url'];
+
+      setState(() => status = "QR parsed. Checking BLE permissions...");
+      await _ensureBlePermissions();
+
+      setState(() => status = "Starting BLE advertising...");
+      await _startBleAdvertising(sid);
+
+      // Fetch challenge
+      final resp = await http.get(Uri.parse('$baseUrl/pair?sid=$sid'));
+      if (resp.statusCode != 200) {
+        setState(() => status = "Pair fetch failed (${resp.statusCode})");
+        return;
+      }
+      final j = jsonDecode(resp.body);
+      final challengeB64 = j['challenge'];
+      final sessionId = j['sessionId'];
+
+      // Biometric auth
+      final ok = await auth.authenticate(
+        localizedReason: 'Authenticate to link device',
+        options: const AuthenticationOptions(biometricOnly: false),
+      );
+      if (!ok) {
+        await _stopBleAdvertising();
+        setState(() => status = "Biometric cancelled");
+        return;
+      }
+
+      // Give desktop time to detect BLE
+      await Future.delayed(const Duration(seconds: 3));
+
+      // Build WebAuthn-style data
+      final clientData = jsonEncode({
+        "type": "webauthn.get",
+        "challenge": challengeB64,
+        "origin": urlFromQr,
+        "crossOrigin": false
+      });
+      final clientBytes = utf8.encode(clientData);
+      final rpHash = _sha256(utf8.encode(rpId));
+      final clientHash = _sha256(clientBytes);
+
+      final flags = <int>[0x05]; // user present + verified
+      final counter = <int>[0, 0, 0, 1];
+      final authData = Uint8List.fromList([...rpHash, ...flags, ...counter]);
+      final toSign = Uint8List.fromList([...rpHash, ...authData, ...clientHash]);
+
+      var dBytes = await storage.read(key: 'passkey_priv_$userId');
+      dBytes ??= base64Url.encode(List.generate(32, (_) => math.Random.secure().nextInt(256)));
+      final d = _b64UrlFlexDecode(dBytes);
+      final sig = _ecdsaSignDerSha256P256(toSign, d);
+
+      final finish = await http.post(
+        Uri.parse('$baseUrl/webauthn/finish'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          "sessionId": sessionId,
+          "userId": userId,
+          "credentialId": "demo-cred",
+          "clientDataJSON": b64u(clientBytes),
+          "authenticatorData": b64u(authData),
+          "signature": b64u(sig),
+        }),
+      );
+
+      await _stopBleAdvertising();
+
+      if (finish.statusCode == 200) {
+        setState(() => status = "✅ Linked!");
+      } else {
+        setState(() => status = "Link failed: ${finish.body}");
+      }
+    } catch (e) {
+      await _stopBleAdvertising();
+      setState(() => status = "Link error: $e");
+    }
+  }
+
+  // ---------------- BLE via native MethodChannel ----------------
+  Future<void> _startBleAdvertising(String sid) async {
+    try {
+      final res = await _bleChannel.invokeMethod('startBle', {"sid": sid});
+      isAdvertising = true;
+      setState(() => status = "✅ BLE advertising started (sid=$sid, res=$res)");
+    } on PlatformException catch (e) {
+      setState(() => status = "BLE start error: ${e.message}");
+    } catch (e) {
+      setState(() => status = "BLE start error: $e");
+    }
+  }
+
+  Future<void> _stopBleAdvertising() async {
+    if (!isAdvertising) return;
+    try {
+      await _bleChannel.invokeMethod('stopBle');
+    } catch (_) {}
+    isAdvertising = false;
+  }
+
+  // ---------------- UI ----------------
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("PAL Demo (Phone)")),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              "Steps:\n1. Create key\n2. Open / or /link on desktop\n3. Scan QR\n4. Approve biometric\n5. Wait for ✅ Linked",
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                ElevatedButton(
+                  onPressed: registerKey,
+                  child: const Text("Create Key"),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(
+                  onPressed: scanAndLink,
+                  child: const Text("Scan & Link"),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(
+                  onPressed: () async {
+                    await storage.deleteAll();
+                    setState(() => status = "Keys cleared");
+                  },
+                  child: const Text("Reset"),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Text("Status: $status"),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------- QR Scanner ----------------
+class ScanPage extends StatefulWidget {
+  const ScanPage({super.key});
+  @override
+  State<ScanPage> createState() => _ScanPageState();
+}
+
+class _ScanPageState extends State<ScanPage> {
+  final GlobalKey qrKey = GlobalKey(debugLabel: 'QR');
+  QRViewController? controller;
+  bool handled = false;
+
+  void _onQRViewCreated(QRViewController c) {
+    controller = c;
+    c.scannedDataStream.listen((scanData) {
+      if (handled) return;
+      handled = true;
+      controller?.pauseCamera();
+      Navigator.pop(context, scanData.code);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("Scan QR")),
+      body: Column(
+        children: [
+          Expanded(
+            flex: 4,
+            child: QRView(key: qrKey, onQRViewCreated: _onQRViewCreated),
+          ),
+          const Expanded(
+            flex: 1,
+            child: Center(
+              child: Text("Scan QR from the desktop web page"),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
